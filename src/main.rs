@@ -1,103 +1,137 @@
-use sysinfo::{Process, System, Pid};
-use dialoguer::{Confirm, Input};
-use std::ffi::OsStr;
+use chrono::Local;
+use sysinfo::{System, Process, Pid, Signal};
+use dialoguer::{Input, Confirm};
 use std::fs::OpenOptions;
 use std::io::Write;
-use chrono::Local;
 
-//List top N processes by CPU usage
-fn list_top_processes(limit: usize) {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let mut processes: Vec<_> = sys.processes().values().collect();
-    processes.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap());
-
-    println!("Top {} processes by CPU usage:", limit);
-    for process in processes.iter().take(limit) {
-        println!(
-            "[PID: {}] {:?} - {:.2}% CPU",
-            process.pid(),
-            process.name(), // Uses {:?} to display OsStr
-            process.cpu_usage()
-        );
-    }
+struct ProcessManager {
+    system: System,
 }
 
-// Warn about high-CPU processes
-fn check_high_cpu_usage(threshold: f32) {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+impl ProcessManager {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_all();
+        Self { system }
+    }
 
-    for process in sys.processes().values() {
-        if process.cpu_usage() > threshold {
+    // List top N processes by CPU usage
+    fn list_top_processes(&self, limit: usize) {
+        let mut processes: Vec<_> = self.system.processes().values().collect();
+        processes.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap());
+
+        println!("Top {} processes by CPU usage:", limit);
+        for process in processes.iter().take(limit) {
             println!(
-                "⚠️ High CPU Usage: [PID: {}] {:?} - {:.2}% CPU",
+                "[PID: {}] {} - {:.2}% CPU",
                 process.pid(),
                 process.name(),
                 process.cpu_usage()
             );
         }
     }
-}
 
-//Ask user if they want to kill a process
-fn prompt_kill_process(pid: Pid, name: &OsStr) {
-    if Confirm::new()
-        .with_prompt(format!(
-            "Do you want to kill process '{}' [PID: {}]?",
-            name.to_string_lossy(),
-            pid
-        ))
-        .interact()
-        .unwrap()
-    {
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        if let Some(process) = sys.process(pid) {
-            if process.kill() {
-                println!("Killed [PID: {}]", pid);
-                log_killed_process(pid, &name.to_string_lossy());
-            } else {
-                println!("Failed to kill [PID: {}]", pid);
+    // Check for high CPU usage (> threshold)
+    fn check_high_cpu_usage(&self, threshold: f32) {
+        for process in self.system.processes().values() {
+            if process.cpu_usage() > threshold {
+                println!(
+                    "⚠️ High CPU Usage Detected: [PID: {}] {} - {:.2}% CPU",
+                    process.pid(),
+                    process.name(),
+                    process.cpu_usage()
+                );
             }
         }
     }
-}
-fn log_killed_process(pid: Pid, name: &str) {
-    let now = Local::now();
-    let timestamp = now.format("%Y-%m-%d %H:%M:%S");
-    let log_entry = format!("[{}] Killed Process: {} (PID: {})\n", timestamp, name, pid);
 
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("lpm_log.txt")
-        .expect("Failed to open log file.");
+    // Prompt user to kill a process
+    fn prompt_kill_process(&self, pid: Pid) {
+        let process = self.system.process(pid);
+        if let Some(proc) = process {
+            if Confirm::new()
+                .with_prompt(format!("Do you want to kill process '{}' [PID: {}]?", proc.name(), pid))
+                .interact()
+                .unwrap()
+            {
+                if proc.kill_with(Signal::Kill).is_some() {
+                    let name = proc.name();
+                    self.log_killed_process(pid, name);
+                    println!("✅ Killed process '{}' (PID: {})", name, pid);
+                } else {
+                    println!("❌ Failed to kill process with PID {}", pid);
+                }
+            }
+        } else {
+            println!("⚠️ No process found with PID {}", pid);
+        }
+    }
 
-    file.write_all(log_entry.as_bytes())
-        .expect("Failed to write to log file.");
+    // Log killed process to file
+    fn log_killed_process(&self, pid: Pid, name: &str) {
+        let now = Local::now();
+        let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+        let entry = format!("[{}] Killed Process: {} (PID: {})\n", timestamp, name, pid);
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("lpm_log.txt")
+            .expect("Failed to open log file");
+
+        file.write_all(entry.as_bytes()).expect("Failed to write to log file");
+    }
 }
 
 fn main() {
-    let top_n = 10;
-    list_top_processes(top_n);
-    check_high_cpu_usage(80.0);
+    let process_manager = ProcessManager::new();
 
-    let pid_input: usize = Input::new()
-        .with_prompt("Enter PID to kill (or 0 to skip)")
-        .interact_text()
-        .unwrap();
+    loop {
+        println!("1. List Top Processes");
+        println!("2. Check High CPU Usage");
+        println!("3. Kill a Process");
+        println!("4. Exit");
 
-    if pid_input != 0 {
-        let pid = Pid::from(pid_input); // Converts usize to Pid
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let choice: u32 = Input::new()
+            .with_prompt("Please choose an option")
+            .interact_text()
+            .unwrap();
 
-        if let Some(proc) = sys.process(pid) {
-            prompt_kill_process(proc.pid(), proc.name());
-        } else {
-            println!("⚠️ No process with PID {} found.", pid_input);
+        match choice {
+            1 => {
+                let limit: usize = Input::new()
+                    .with_prompt("Enter the number of top processes to list")
+                    .default(10)
+                    .interact_text()
+                    .unwrap();
+                process_manager.list_top_processes(limit);
+            }
+            2 => {
+                let threshold: f32 = Input::new()
+                    .with_prompt("Enter the CPU usage threshold for high usage")
+                    .default(80.0)
+                    .interact_text()
+                    .unwrap();
+                process_manager.check_high_cpu_usage(threshold);
+            }
+            3 => {
+                let pid_input: String = Input::new()
+                    .with_prompt("Enter the PID of the process to kill")
+                    .interact_text()
+                    .unwrap();
+
+                if let Ok(pid) = pid_input.parse::<u32>() {
+                    process_manager.prompt_kill_process(Pid::from(pid as usize));
+
+                } else {
+                    println!("❗ Invalid PID input!");
+                }
+            }
+            4 => {
+                println!("Exiting...");
+                break;
+            }
+            _ => println!("Invalid option, please try again."),
         }
     }
 }
